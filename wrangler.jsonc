@@ -4,8 +4,7 @@
   "compatibility_date": "2026-09-30",
 
   "vars": {
-    "LZHE_API_KEY": "lzhe_9f3a1c7e55d2408bb61e0c3a9d72f45e",
-    "LZHE_BASE_URL": "http://127.0.0.1:3000"
+    "LZHE_BASE_URL": "https://liuzhe.world"
   },
 
   "observability": {

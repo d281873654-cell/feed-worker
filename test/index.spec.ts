@@ -1,29 +1,29 @@
 import {
-	env,
-	createExecutionContext,
-	waitOnExecutionContext,
-	SELF,
+  env,
+  SELF,
 } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import worker from "../src/index";
 
-// For now, you'll need to do something like this to get a correctly-typed
-// `Request` to pass to `worker.fetch()`.
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 
-describe("Hello World worker", () => {
-	it("responds with Hello World! (unit style)", async () => {
-		const request = new IncomingRequest("http://example.com");
-		// Create an empty context to pass to `worker.fetch()`.
-		const ctx = createExecutionContext();
-		const response = await worker.fetch(request, env, ctx);
-		// Wait for all `Promise`s passed to `ctx.waitUntil()` to settle before running test assertions
-		await waitOnExecutionContext(ctx);
-		expect(await response.text()).toMatchInlineSnapshot(`"Hello World!"`);
-	});
+const ROOT_RESPONSE =
+  "feed-worker 运行中。手动触发：GET /sync + x-api-key / Authorization: Bearer";
 
-	it("responds with Hello World! (integration style)", async () => {
-		const response = await SELF.fetch("https://example.com");
-		expect(await response.text()).toMatchInlineSnapshot(`"Hello World!"`);
-	});
+describe("feed-worker", () => {
+  it("returns the worker status from the fetch handler", async () => {
+    const request = new IncomingRequest("http://example.com");
+
+    const response = await worker.fetch(request, env);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(ROOT_RESPONSE);
+  });
+
+  it("returns the worker status through the integration runtime", async () => {
+    const response = await SELF.fetch("https://example.com");
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(ROOT_RESPONSE);
+  });
 });

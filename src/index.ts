@@ -25,7 +25,7 @@ const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
   removeNSPrefix: true,
-  isArray: (name) => ["item", "entry", "link"].includes(name),
+  isArray: (name: string) => ["item", "entry", "link"].includes(name),
 });
 
 function toText(value: unknown): string {
@@ -92,24 +92,74 @@ function parseFeed(xml: string): ParsedItem[] {
   return out;
 }
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getRetryAfterMs(response: Response): number | null {
+  const raw = response.headers.get("Retry-After");
+  if (!raw) return null;
+
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, Math.min(seconds * 1000, 15000));
+  }
+
+  const at = Date.parse(raw);
+  if (Number.isFinite(at)) {
+    return Math.max(0, Math.min(at - Date.now(), 15000));
+  }
+
+  return null;
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
 async function fetchWithRetry(
   url: string,
   attempts = 2,
   timeoutMs = 60000
 ): Promise<Response> {
   let lastError: unknown = null;
+
   for (let i = 0; i < attempts; i++) {
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-      return res;
+      const res = await fetch(url, {
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+
+      if (!isRetryableStatus(res.status) || i === attempts - 1) {
+        return res;
+      }
+
+      const retryAfter = getRetryAfterMs(res);
+      await sleep(retryAfter ?? 1000 * (i + 1));
     } catch (e) {
       lastError = e;
+      if (i < attempts - 1) {
+        await sleep(1000 * (i + 1));
+      }
     }
   }
+
   throw lastError ?? new Error("fetch failed");
 }
 
+function isBilibiliRateLimited(code?: number, status?: number): boolean {
+  return code === -412 || code === -352 || status === 412 || status === 429;
+}
+
+class BilibiliRateLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BilibiliRateLimitError";
+  }
+}
+
 // ---------- B站直抓 ----------
+
 
 const WBI_MIXIN_KEY_ENC_TABLE = [
   46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
@@ -121,6 +171,36 @@ const WBI_MIXIN_KEY_ENC_TABLE = [
 const BILI_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
+const BILI_REQUEST_HEADERS = {
+  "User-Agent": BILI_UA,
+  "Accept-Language": "zh-CN,zh;q=0.9",
+  Accept: "application/json, text/plain, */*",
+  Referer: "https://www.bilibili.com/",
+};
+
+const BILI_WBI_CACHE_KEY =
+  "https://feed-worker.internal/__cache/bilibili-wbi-keys";
+const BILI_WBI_CACHE_TTL_SECONDS = 15 * 60;
+
+interface BilibiliWbiKeys {
+  imgKey: string;
+  subKey: string;
+}
+
+let memoryWbiKeys: {
+  value: BilibiliWbiKeys;
+  expiresAt: number;
+} | null = null;
+
+let bilibiliRequestChain: Promise<void> = Promise.resolve();
+
+function getMixinKey(orig: string): string {
+  return WBI_MIXIN_KEY_ENC_TABLE.slice(0, 32)
+    .map((i) => orig[i])
+    .join("")
+    .slice(0, 32);
+}
+
 async function md5hex(text: string): Promise<string> {
   const buf = await crypto.subtle.digest("MD5", new TextEncoder().encode(text));
   return Array.from(new Uint8Array(buf))
@@ -128,10 +208,25 @@ async function md5hex(text: string): Promise<string> {
     .join("");
 }
 
-function getMixinKey(orig: string): string {
-  return WBI_MIXIN_KEY_ENC_TABLE.slice(0, 32)
-    .map((i) => orig[i])
-    .join("");
+async function withBilibiliSpacing<T>(
+  fn: () => Promise<T>,
+  minIntervalMs = 1200
+): Promise<T> {
+  const previous = bilibiliRequestChain;
+
+  let release!: () => void;
+  bilibiliRequestChain = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await previous;
+
+  try {
+    await sleep(minIntervalMs);
+    return await fn();
+  } finally {
+    release();
+  }
 }
 
 async function getBilibiliCookie(): Promise<string> {
@@ -144,9 +239,12 @@ async function getBilibiliCookie(): Promise<string> {
     },
   });
 
+  if (!res.ok) return "";
+
   const headersAny = res.headers as unknown as {
     getSetCookie?: () => string[];
   };
+
   const rawCookies: string[] =
     typeof headersAny.getSetCookie === "function"
       ? headersAny.getSetCookie()
@@ -158,34 +256,233 @@ async function getBilibiliCookie(): Promise<string> {
     .join("; ");
 }
 
-async function fetchBilibiliItems(mid: string, sessdata: string): Promise<ParsedItem[]> {
+function parseJsonText(text: string, label: string): any {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(
+      `B站返回非 JSON（${label} 前 80 字符: ${text.slice(0, 80)}）`
+    );
+  }
+}
+
+async function readBilibiliJson(
+  url: string,
+  headers: HeadersInit,
+  label: string
+): Promise<{ response: Response; data: any }> {
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(20000),
+    headers,
+  });
+
+  const text = await response.text();
+  const data = parseJsonText(text, label);
+
+  if (isBilibiliRateLimited(data?.code, response.status)) {
+    throw new BilibiliRateLimitError(
+      `${label} 触发 B站风控 HTTP=${response.status} code=${data?.code} msg=${data?.message ?? "未知"}`
+    );
+  }
+
+  return { response, data };
+}
+
+async function parseCachedWbiKeys(response: Response): Promise<BilibiliWbiKeys | null> {
+  try {
+    const value = (await response.json()) as Partial<BilibiliWbiKeys>;
+    if (
+      typeof value.imgKey === "string" &&
+      value.imgKey &&
+      typeof value.subKey === "string" &&
+      value.subKey
+    ) {
+      return {
+        imgKey: value.imgKey,
+        subKey: value.subKey,
+      };
+    }
+  } catch {
+    // 缓存内容损坏时回源刷新
+  }
+
+  return null;
+}
+
+async function getBilibiliWbiKeys(): Promise<BilibiliWbiKeys> {
+  if (memoryWbiKeys && memoryWbiKeys.expiresAt > Date.now()) {
+    return memoryWbiKeys.value;
+  }
+
+  const cache = caches.default;
+  const cacheKey = new Request(BILI_WBI_CACHE_KEY, { method: "GET" });
+  const cached = await cache.match(cacheKey);
+
+  if (cached) {
+    const cachedKeys = await parseCachedWbiKeys(cached);
+    if (cachedKeys) {
+      memoryWbiKeys = {
+        value: cachedKeys,
+        expiresAt: Date.now() + BILI_WBI_CACHE_TTL_SECONDS * 1000,
+      };
+      return cachedKeys;
+    }
+  }
+
+  const { data: nav } = await withBilibiliSpacing(() =>
+    readBilibiliJson(
+      "https://api.bilibili.com/x/web-interface/nav",
+      BILI_REQUEST_HEADERS,
+      "nav"
+    )
+  );
+
+  const imgUrl = String(nav?.data?.wbi_img?.img_url ?? "");
+  const subUrl = String(nav?.data?.wbi_img?.sub_url ?? "");
+
+  if (!imgUrl || !subUrl) {
+    throw new Error(
+      `B站 nav 未返回 WBI key img=${imgUrl ? "ok" : "missing"} sub=${subUrl ? "ok" : "missing"}`
+    );
+  }
+
+  const imgKey = imgUrl.split("/").pop()?.split(".")[0] ?? "";
+  const subKey = subUrl.split("/").pop()?.split(".")[0] ?? "";
+
+  if (!imgKey || !subKey) {
+    throw new Error("B站 WBI key 格式异常");
+  }
+
+  const value: BilibiliWbiKeys = { imgKey, subKey };
+
+  memoryWbiKeys = {
+    value,
+    expiresAt: Date.now() + BILI_WBI_CACHE_TTL_SECONDS * 1000,
+  };
+
+  await cache.put(
+    cacheKey,
+    new Response(JSON.stringify(value), {
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "Cache-Control": `public, max-age=${BILI_WBI_CACHE_TTL_SECONDS}`,
+      },
+    })
+  );
+
+  return value;
+}
+
+function buildWbiQuery(
+  params: Record<string, string>,
+  mixinKey: string
+): Promise<string> {
+  const filteredParams = Object.fromEntries(
+    Object.entries(params).map(([key, value]) => [
+      key,
+      value.replace(/[!'()*]/g, ""),
+    ])
+  );
+
+  const query = Object.keys(filteredParams)
+    .sort()
+    .map(
+      (key) =>
+        `${encodeURIComponent(key)}=${encodeURIComponent(filteredParams[key])}`
+    )
+    .join("&");
+
+  return Promise.resolve(md5hex(query + mixinKey)).then(
+    (wRid) => `${query}&w_rid=${wRid}`
+  );
+}
+
+async function fetchBilibiliSeriesItems(mid: string): Promise<ParsedItem[]> {
+  const url = new URL(
+    "https://api.bilibili.com/x/series/recArchivesByKeywords"
+  );
+  url.searchParams.set("mid", mid);
+  url.searchParams.set("keywords", "");
+  url.searchParams.set("ps", "30");
+  url.searchParams.set("pn", "1");
+  url.searchParams.set("orderby", "pubdate");
+
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const { data } = await withBilibiliSpacing(() =>
+        readBilibiliJson(url.toString(), BILI_REQUEST_HEADERS, "投稿列表")
+      );
+
+      if (data?.code !== 0) {
+        throw new Error(
+          `B站投稿列表 API 错误 code=${data?.code} msg=${data?.message ?? "未知错误"}`
+        );
+      }
+
+      const archives: any[] = Array.isArray(data?.data?.archives)
+        ? data.data.archives
+        : [];
+
+      const seen = new Set<string>();
+      return archives
+        .map((v) => {
+          const bvid = String(v?.bvid ?? "").trim();
+          const title = String(v?.title ?? "").trim();
+
+          return {
+            title,
+            url: bvid ? `https://www.bilibili.com/video/${bvid}` : "",
+            summary: cleanSummary(
+              String(v?.desc ?? v?.description ?? "")
+            ),
+            published_at:
+              Number.isFinite(Number(v?.pubdate)) && Number(v.pubdate) > 0
+                ? new Date(Number(v.pubdate) * 1000).toISOString()
+                : null,
+          };
+        })
+        .filter((item) => {
+          const bvid = item.url.split("/").pop() ?? "";
+          if (!item.title || !bvid || seen.has(bvid)) return false;
+          seen.add(bvid);
+          return true;
+        });
+    } catch (e) {
+      lastError = e;
+
+      if (!(e instanceof BilibiliRateLimitError) || attempt === 1) {
+        throw e;
+      }
+
+      await sleep(10000);
+    }
+  }
+
+  throw lastError ?? new Error("B站投稿列表抓取失败");
+}
+
+async function fetchBilibiliWbiItems(
+  mid: string,
+  sessdata: string
+): Promise<ParsedItem[]> {
   const buvid = await getBilibiliCookie();
-  const cookie = buvid ? `${buvid}; SESSDATA=${sessdata}` : `SESSDATA=${sessdata}`;
+  const cookie = buvid
+    ? `${buvid}; SESSDATA=${sessdata}`
+    : `SESSDATA=${sessdata}`;
+
   const apiHeaders = {
-    "User-Agent": BILI_UA,
-    "Accept-Language": "zh-CN,zh;q=0.9",
-    Accept: "application/json, text/plain, */*",
-    Referer: `https://space.bilibili.com/${mid}`,
+    ...BILI_REQUEST_HEADERS,
     Cookie: cookie,
   };
 
-  const navRes = await fetch("https://api.bilibili.com/x/web-interface/nav", {
-    signal: AbortSignal.timeout(20000),
-    headers: apiHeaders,
-  });
-  const navText = await navRes.text();
-  let nav: any;
-  try {
-    nav = JSON.parse(navText);
-  } catch {
-    throw new Error(`B站 WAF 拦截（nav 返回 HTML 前 80 字符: ${navText.slice(0, 80)}）`);
-  }
-  const imgUrl: string = nav?.data?.wbi_img?.img_url ?? "";
-  const subUrl: string = nav?.data?.wbi_img?.sub_url ?? "";
-  const imgKey = imgUrl.split("/").pop()?.split(".")[0] ?? "";
-  const subKey = subUrl.split("/").pop()?.split(".")[0] ?? "";
+  const { imgKey, subKey } = await getBilibiliWbiKeys();
   const mixinKey = getMixinKey(imgKey + subKey);
-  if (!mixinKey) throw new Error("获取 wbi 公钥失败");
+
+  if (!mixinKey) {
+    throw new Error("B站 WBI mixin key 生成失败");
+  }
 
   const params: Record<string, string> = {
     mid,
@@ -193,49 +490,122 @@ async function fetchBilibiliItems(mid: string, sessdata: string): Promise<Parsed
     pn: "1",
     order: "pubdate",
     platform: "web",
-    dm_img_list: "[]",
-    dm_img_str:
-      "V2ViR0wgMS4wIChPcGVuR0wgRVMgMy4wIChXaW5kb3dzIE5UIDEwLjA7IFdpbjY0OyB4NjQpKSBDaHJvbWUvMTIwLjAuMC4wIFNhZmFyaS8xMjAuMC4wLjA=",
-    dm_cover_img_str: "QUJDREVGRw==",
-    dm_img_inter: '{"ds":[],"wh":[0,0,0],"of":[0,0,0]}',
+    web_location: "1550101",
+    order_avoided: "true",
     wts: Math.floor(Date.now() / 1000).toString(),
   };
-  const query = Object.keys(params)
-    .sort()
-    .map((k) => `${k}=${encodeURIComponent(params[k])}`)
-    .join("&");
-  const w_rid = await md5hex(query + mixinKey);
 
-  const apiUrl = `https://api.bilibili.com/x/space/wbi/arc/search?${query}&w_rid=${w_rid}`;
-  const res = await fetch(apiUrl, {
-    signal: AbortSignal.timeout(20000),
-    headers: apiHeaders,
-  });
-  const dataText = await res.text();
-  let data: any;
-  try {
-    data = JSON.parse(dataText);
-  } catch {
-    throw new Error(
-      `B站 WAF 拦截（arc/search 返回 HTML 前 80 字符: ${dataText.slice(0, 80)}）`
-    );
-  }
-  if (data.code !== 0) {
-    throw new Error(`B站 API 错误 code=${data.code} msg=${data.message}`);
+  const signedQuery = await buildWbiQuery(params, mixinKey);
+  const apiUrl = `https://api.bilibili.com/x/space/wbi/arc/search?${signedQuery}`;
+
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const { data } = await withBilibiliSpacing(() =>
+        readBilibiliJson(apiUrl, apiHeaders, "WBI 投稿列表")
+      );
+
+      if (data?.code !== 0) {
+        throw new Error(
+          `B站 WBI API 错误 code=${data?.code} msg=${data?.message ?? "未知错误"}`
+        );
+      }
+
+      const vlist: any[] = Array.isArray(data?.data?.list?.vlist)
+        ? data.data.list.vlist
+        : [];
+
+      return vlist
+        .map((v) => ({
+          title: String(v?.title ?? "").trim(),
+          url: v?.bvid
+            ? `https://www.bilibili.com/video/${v.bvid}`
+            : "",
+          summary: cleanSummary(String(v?.description ?? "")),
+          published_at:
+            Number.isFinite(Number(v?.created)) && Number(v.created) > 0
+              ? new Date(Number(v.created) * 1000).toISOString()
+              : null,
+        }))
+        .filter((i) => i.title && i.url);
+    } catch (e) {
+      lastError = e;
+
+      if (!(e instanceof BilibiliRateLimitError) || attempt === 1) {
+        throw e;
+      }
+
+      await sleep(10000);
+    }
   }
 
-  const vlist: any[] = data?.data?.list?.vlist ?? [];
-  return vlist
-    .map((v) => ({
-      title: String(v.title ?? "").trim(),
-      url: `https://www.bilibili.com/video/${v.bvid}`,
-      summary: cleanSummary(String(v.description ?? "")),
-      published_at: v.created ? new Date(v.created * 1000).toISOString() : null,
-    }))
-    .filter((i) => i.title && i.url);
+  throw lastError ?? new Error("B站 WBI 投稿列表抓取失败");
 }
 
-// ---------------------------------------------------------------------------
+async function fetchBilibiliItems(
+  mid: string,
+  sessdata: string
+): Promise<ParsedItem[]> {
+  let seriesError = "";
+
+  try {
+    return await fetchBilibiliSeriesItems(mid);
+  } catch (e) {
+    seriesError = e instanceof Error ? e.message : String(e);
+
+    // 已触发风控时优先避免继续打 nav。
+    if (e instanceof BilibiliRateLimitError) {
+      return await fetchBilibiliItemsFromCachedWbi(mid, sessdata, seriesError);
+    }
+  }
+
+  try {
+    return await fetchBilibiliWbiItems(mid, sessdata);
+  } catch (e) {
+    const wbiError = e instanceof Error ? e.message : String(e);
+    throw new Error(
+      `B站抓取失败；投稿列表=${seriesError || "失败"}；WBI=${wbiError}`
+    );
+  }
+}
+
+async function fetchBilibiliItemsFromCachedWbi(
+  mid: string,
+  sessdata: string,
+  seriesError: string
+): Promise<ParsedItem[]> {
+  const cache = caches.default;
+  const cacheKey = new Request(BILI_WBI_CACHE_KEY, { method: "GET" });
+  const cached = await cache.match(cacheKey);
+
+  if (!cached) {
+    throw new Error(
+      `B站投稿列表触发风控（${seriesError}），当前无可用 WBI 缓存`
+    );
+  }
+
+  const keys = await parseCachedWbiKeys(cached);
+  if (!keys) {
+    throw new Error(
+      `B站投稿列表触发风控（${seriesError}），WBI 缓存内容无效`
+    );
+  }
+
+  memoryWbiKeys = {
+    value: keys,
+    expiresAt: Date.now() + BILI_WBI_CACHE_TTL_SECONDS * 1000,
+  };
+
+  try {
+    return await fetchBilibiliWbiItems(mid, sessdata);
+  } catch (e) {
+    const wbiError = e instanceof Error ? e.message : String(e);
+    throw new Error(
+      `B站投稿列表触发风控（${seriesError}）；缓存 WBI 读取也失败（${wbiError}）`
+    );
+  }
+}
 
 // 抓取失败时把错误回写到网站（写不进就算了，不影响本地日志）
 async function reportSourceError(
@@ -255,25 +625,76 @@ async function reportSourceError(
   }
 }
 
+async function cleanupDismissed(
+  base: string,
+  authHeaders: Record<string, string>,
+): Promise<string> {
+  try {
+    const response = await fetch(`${base}/api/feed/cleanup`, {
+      method: "POST",
+      headers: authHeaders,
+    });
+
+    const payload = (await response.json().catch(() => ({}))) as {
+      deleted?: number;
+      error?: string;
+    };
+
+    if (!response.ok) {
+      return (
+        `清理 dismissed 失败 HTTP ${response.status}` +
+        (payload.error ? `: ${payload.error}` : "")
+      );
+    }
+
+    return `清理 dismissed ${payload.deleted ?? 0} 条`;
+  } catch (error) {
+    return `清理 dismissed 异常: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+  }
+}
+
 async function syncAll(env: Env): Promise<string> {
   const base = env.LZHE_BASE_URL.replace(/\/+$/, "");
   const authHeaders = { "x-api-key": env.LZHE_API_KEY };
 
-  // 1. 拉取启用的来源列表
-  const res = await fetch(`${base}/api/feed/sources`, { headers: authHeaders });
-  if (!res.ok) throw new Error(`拉取来源列表失败: HTTP ${res.status}`);
-  const data = (await res.json()) as { sources?: FeedSource[] };
+  // 1. 先清理超过 7 天的 dismissed
+  const logs: string[] = [];
+  logs.push(await cleanupDismissed(base, authHeaders));
+
+  // 2. 拉取启用的来源列表
+  const res = await fetch(`${base}/api/feed/sources`, {
+    headers: authHeaders,
+  });
+
+  if (!res.ok) {
+    throw new Error(`拉取来源列表失败: HTTP ${res.status}`);
+  }
+
+  const data = (await res.json()) as {
+    sources?: FeedSource[];
+  };
+
   const sources = data.sources ?? [];
 
-  if (sources.length === 0) return "没有启用的来源，无事可做";
+  if (sources.length === 0) {
+    logs.push("没有启用的来源，无事可做");
+    return logs.join("\n");
+  }
 
-  // 2. 逐个源抓取、解析、推送
-  const logs: string[] = [];
   for (const source of sources) {
     try {
       let items: ParsedItem[];
 
       if (source.platform === "bilibili") {
+        if (!source.feed_url) {
+          const msg = "B站来源缺少 feed_url";
+          logs.push(`[${source.name}] ${msg}`);
+          await reportSourceError(base, authHeaders, source.id, msg);
+          continue;
+        }
+
         const mid = source.feed_url.match(/\/(\d+)(?:[/?#]|$)/)?.[1];
         if (!mid) {
           const msg = "无法从 feed_url 解析 B站 UID";
@@ -281,11 +702,13 @@ async function syncAll(env: Env): Promise<string> {
           await reportSourceError(base, authHeaders, source.id, msg);
           continue;
         }
+
         if (!env.BILI_SESSDATA) {
-          throw new Error("未配置 BILI_SESSDATA（B站登录 Cookie），无法抓取该源");
+          throw new Error("未配置 BILI_SESSDATA（B站 Cookie），WBI 兜底链路不可用");
         }
-        items = await fetchBilibiliItems(mid, env.BILI_SESSDATA!);
-             } else if (source.platform === "youtube") {
+
+        items = await fetchBilibiliItems(mid, env.BILI_SESSDATA);
+      } else if (source.platform === "youtube") {
         // 官方 feed 优先（部署到 Cloudflare 后网络可用），失败走社区镜像兜底
         const chId = source.feed_url.match(/(UC[\w-]{20,})/)?.[1];
         if (!chId) {
@@ -319,6 +742,13 @@ async function syncAll(env: Env): Promise<string> {
         }
         items = parseFeed(await feedRes.text());
       } else {
+        if (!source.feed_url) {
+          const msg = "RSS 来源缺少 feed_url";
+          logs.push(`[${source.name}] ${msg}`);
+          await reportSourceError(base, authHeaders, source.id, msg);
+          continue;
+        }
+
         const feedRes = await fetchWithRetry(source.feed_url);
         if (!feedRes.ok) {
           const msg = `拉取 RSS 失败 HTTP ${feedRes.status}`;
@@ -345,9 +775,10 @@ async function syncAll(env: Env): Promise<string> {
       };
 
       if (!pushRes.ok) {
-        logs.push(
-          `[${source.name}] 推送失败 HTTP ${pushRes.status}: ${JSON.stringify(result)}`
-        );
+        const msg =
+          `推送失败 HTTP ${pushRes.status}: ${JSON.stringify(result)}`;
+        logs.push(`[${source.name}] ${msg}`);
+        await reportSourceError(base, authHeaders, source.id, msg);
         continue;
       }
 
@@ -368,10 +799,15 @@ async function syncAll(env: Env): Promise<string> {
 export default {
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
-    if (
-      url.pathname === "/sync" &&
-      url.searchParams.get("key") === env.LZHE_API_KEY
-    ) {
+    const apiKey = request.headers.get("x-api-key")?.trim() ?? "";
+    const authorization = request.headers
+      .get("authorization")
+      ?.replace(/^Bearer\s+/i, "")
+      .trim() ?? "";
+
+    const authorized = apiKey === env.LZHE_API_KEY || authorization === env.LZHE_API_KEY;
+
+    if (url.pathname === "/sync" && authorized) {
       try {
         const log = await syncAll(env);
         return new Response(log, {
@@ -390,8 +826,9 @@ export default {
         );
       }
     }
+
     return new Response(
-      "feed-worker 运行中。手动触发：GET /sync?key=你的API_KEY"
+      "feed-worker 运行中。手动触发：GET /sync + x-api-key / Authorization: Bearer"
     );
   },
 
