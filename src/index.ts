@@ -4,6 +4,7 @@ interface Env {
   LZHE_API_KEY: string;
   LZHE_BASE_URL: string;
   BILI_SESSDATA: string;
+  RSSHUB_BASE_URL?: string;
 }
 
 interface FeedSource {
@@ -27,6 +28,13 @@ const parser = new XMLParser({
   removeNSPrefix: true,
   isArray: (name: string) => ["item", "entry", "link"].includes(name),
 });
+
+function getRsshubBaseUrl(env: Env): string {
+  return (
+    env.RSSHUB_BASE_URL ??
+    "https://rsshub.ktachibana.party"
+  ).replace(/\/+$/, "");
+}
 
 function toText(value: unknown): string {
   if (value == null) return "";
@@ -614,8 +622,11 @@ async function fetchBilibiliItemsFromCachedWbi(
 }
 
 // 直连（series/WBI）全部失败时的兜底：走 RSSHub 公共实例的 bilibili 路由
-async function fetchBilibiliItemsViaRsshub(mid: string): Promise<ParsedItem[]> {
-  const mirrorUrl = `https://rsshub.ktachibana.party/bilibili/user/video/${mid}`;
+async function fetchBilibiliItemsViaRsshub(
+  mid: string,
+  env: Env
+): Promise<ParsedItem[]> {
+  const mirrorUrl = `${getRsshubBaseUrl(env)}/bilibili/user/video/${mid}`;
   const res = await fetchWithRetry(mirrorUrl, 1, 20000);
 
   if (!res.ok) {
@@ -814,7 +825,7 @@ async function syncAll(env: Env): Promise<string> {
             directError instanceof Error ? directError.message : String(directError);
 
           try {
-            items = await fetchBilibiliItemsViaRsshub(mid);
+            items = await fetchBilibiliItemsViaRsshub(mid, env);
           } catch (mirrorError) {
             const mirrorMsg =
               mirrorError instanceof Error ? mirrorError.message : String(mirrorError);
@@ -833,7 +844,8 @@ async function syncAll(env: Env): Promise<string> {
           continue;
         }
         const official = `https://www.youtube.com/feeds/videos.xml?channel_id=${chId}`;
-        const mirror = `https://rsshub.ktachibana.party/youtube/channel/${chId}`;
+        const mirror =
+          `${getRsshubBaseUrl(env)}/youtube/channel/${chId}`;
         let feedRes: Response | null = null;
         try {
           const r = await fetchWithRetry(official, 1, 20000);
@@ -856,6 +868,30 @@ async function syncAll(env: Env): Promise<string> {
           continue;
         }
         items = parseFeed(await feedRes.text());
+      } else if (source.platform === "xiaohongshu") {
+        const uid = source.feed_url?.match(
+          /\/user\/profile\/([0-9a-f]{24})/
+        )?.[1];
+        if (!uid) {
+          const msg = "无法从小红书链接解析 uid";
+          logs.push(`[${source.name}] ${msg}`);
+          await reportSourceError(base, authHeaders, source.id, msg);
+          continue;
+        }
+
+        // 镜像不稳定：单次抓取 + 最多 1 次重试，错误里带 HTTP 状态码
+        const xhsRes = await fetchWithRetry(
+          `${getRsshubBaseUrl(env)}/xiaohongshu/user/${uid}/notes`,
+          2,
+          20000
+        );
+        if (!xhsRes.ok) {
+          const msg = `小红书镜像抓取失败 HTTP ${xhsRes.status}`;
+          logs.push(`[${source.name}] ${msg}`);
+          await reportSourceError(base, authHeaders, source.id, msg);
+          continue;
+        }
+        items = parseFeed(await xhsRes.text());
       } else {
         if (!source.feed_url) {
           const msg = "RSS 来源缺少 feed_url";
