@@ -128,6 +128,12 @@ async function fetchWithRetry(
     try {
       const res = await fetch(url, {
         signal: AbortSignal.timeout(timeoutMs),
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+          Accept:
+            "application/rss+xml, application/xml, text/xml, */*",
+        },
       });
 
       if (!isRetryableStatus(res.status) || i === attempts - 1) {
