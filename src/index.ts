@@ -613,6 +613,100 @@ async function fetchBilibiliItemsFromCachedWbi(
   }
 }
 
+// 直连（series/WBI）全部失败时的兜底：走 RSSHub 公共实例的 bilibili 路由
+async function fetchBilibiliItemsViaRsshub(mid: string): Promise<ParsedItem[]> {
+  const mirrorUrl = `https://rsshub.ktachibana.party/bilibili/user/video/${mid}`;
+  const res = await fetchWithRetry(mirrorUrl, 1, 20000);
+
+  if (!res.ok) {
+    throw new Error(`RSSHub 镜像 HTTP ${res.status}`);
+  }
+
+  const items = parseFeed(await res.text());
+  if (items.length === 0) {
+    throw new Error("RSSHub 镜像返回 0 条");
+  }
+
+  return items;
+}
+
+// ---------- 来源头像补抓 ----------
+
+// B站空间页 HTML 里的 "face":"..." 字段；JSON 内斜杠转义为 \/，需还原。
+// Cloudflare 机房 IP 抓空间页大概率 412，失败一律返回 null，属预期。
+async function fetchBilibiliAvatar(mid: string): Promise<string | null> {
+  try {
+    const res = await fetch(`https://space.bilibili.com/${mid}`, {
+      signal: AbortSignal.timeout(20000),
+      headers: {
+        "User-Agent": BILI_UA,
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
+    });
+
+    if (!res.ok) return null;
+
+    const html = await res.text();
+    const match = html.match(/"face":"([^"]+)"/);
+    if (!match) return null;
+
+    const url = match[1].replace(/\\\//g, "/");
+    return url.startsWith("https://") ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+// YouTube 频道页 HTML 里的第一个 yt3.ggpht.com 地址即频道头像
+async function fetchYoutubeAvatar(channelId: string): Promise<string | null> {
+  try {
+    const res = await fetch(`https://www.youtube.com/channel/${channelId}`, {
+      signal: AbortSignal.timeout(20000),
+      headers: {
+        "User-Agent": BILI_UA,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
+    });
+
+    if (!res.ok) return null;
+
+    const html = await res.text();
+    const match = html.match(/https:\/\/yt3\.ggpht\.com\/[^"\\&\s]+/);
+    return match ? match[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+// RSS 等无平台头像概念的来源：不发请求，用站点 favicon
+function faviconAvatar(feedUrl: string): string | null {
+  try {
+    const host = new URL(feedUrl).hostname;
+    if (!host) return null;
+    return `https://www.google.com/s2/favicons?domain=${host}&sz=128`;
+  } catch {
+    return null;
+  }
+}
+
+// 总入口：按平台分发，禁止跨平台兜底（bilibili/youtube 抓不到就 null，绝不退到 favicon）
+async function fetchSourceAvatar(source: FeedSource): Promise<string | null> {
+  try {
+    if (source.platform === "bilibili") {
+      const mid = source.feed_url?.match(/\/(\d+)(?:[/?#]|$)/)?.[1];
+      return mid ? await fetchBilibiliAvatar(mid) : null;
+    }
+    if (source.platform === "youtube") {
+      const chId = source.feed_url?.match(/(UC[\w-]{20,})/)?.[1];
+      return chId ? await fetchYoutubeAvatar(chId) : null;
+    }
+    return faviconAvatar(source.feed_url);
+  } catch {
+    return null;
+  }
+}
+
 // 抓取失败时把错误回写到网站（写不进就算了，不影响本地日志）
 async function reportSourceError(
   base: string,
@@ -713,7 +807,22 @@ async function syncAll(env: Env): Promise<string> {
           throw new Error("未配置 BILI_SESSDATA（B站 Cookie），WBI 兜底链路不可用");
         }
 
-        items = await fetchBilibiliItems(mid, env.BILI_SESSDATA);
+        try {
+          items = await fetchBilibiliItems(mid, env.BILI_SESSDATA);
+        } catch (directError) {
+          const directMsg =
+            directError instanceof Error ? directError.message : String(directError);
+
+          try {
+            items = await fetchBilibiliItemsViaRsshub(mid);
+          } catch (mirrorError) {
+            const mirrorMsg =
+              mirrorError instanceof Error ? mirrorError.message : String(mirrorError);
+            throw new Error(
+              `B站抓取失败；直连=${directMsg}；RSSHub镜像=${mirrorMsg}`
+            );
+          }
+        }
       } else if (source.platform === "youtube") {
         // 官方 feed 优先（部署到 Cloudflare 后网络可用），失败走社区镜像兜底
         const chId = source.feed_url.match(/(UC[\w-]{20,})/)?.[1];
@@ -770,10 +879,19 @@ async function syncAll(env: Env): Promise<string> {
         continue;
       }
 
+      // 缺头像的来源顺手补抓（失败返回 null，绝不影响条目同步）
+      const avatarUrl = source.avatar_url
+        ? null
+        : await fetchSourceAvatar(source);
+
       const pushRes = await fetch(`${base}/api/feed/items`, {
         method: "POST",
         headers: { ...authHeaders, "content-type": "application/json" },
-        body: JSON.stringify({ source_id: source.id, items }),
+        body: JSON.stringify(
+          avatarUrl
+            ? { source_id: source.id, items, avatar_url: avatarUrl }
+            : { source_id: source.id, items }
+        ),
       });
       const result = (await pushRes.json().catch(() => ({}))) as {
         inserted?: number;
