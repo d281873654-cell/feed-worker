@@ -5,6 +5,7 @@ interface Env {
   LZHE_BASE_URL: string;
   BILI_SESSDATA: string;
   RSSHUB_BASE_URL?: string;
+  SOCIALDATA_API_KEY?: string;
 }
 
 interface FeedSource {
@@ -13,6 +14,7 @@ interface FeedSource {
   platform: string;
   feed_url: string;
   avatar_url: string | null;
+  cursor?: { x?: { since_id?: string } } | null;
 }
 
 interface ParsedItem {
@@ -641,6 +643,165 @@ async function fetchBilibiliItemsViaRsshub(
   return items;
 }
 
+// ---------- X（SocialData）----------
+
+// X 保留路径段（大小写不敏感）：路径第一段命中这些就不是博主主页
+const X_RESERVED_SEGMENTS = new Set([
+  "status",
+  "home",
+  "search",
+  "i",
+  "settings",
+  "messages",
+  "notifications",
+  "explore",
+]);
+
+// 与主站 resolveSourceUrl 的识别规则保持一致：路径第一段即 handle
+function extractXHandle(rawUrl: string): string | null {
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    if (
+      host !== "x.com" &&
+      host !== "twitter.com" &&
+      host !== "mobile.twitter.com"
+    ) {
+      return null;
+    }
+    const m = new URL(rawUrl).pathname.match(
+      /^\/([A-Za-z0-9_]{1,20})(?:\/|$)/
+    );
+    if (!m || X_RESERVED_SEGMENTS.has(m[1].toLowerCase())) return null;
+    return m[1];
+  } catch {
+    return null;
+  }
+}
+
+/*
+ * 只负责请求、解析、计算 nextCursor；不写数据库、不改 source.cursor。
+ * cursor 推进铁律：只有请求完全成功且解析出 ≥1 条推文时才返回新 nextCursor；
+ * 任何失败（429/5xx）或 0 条推文，一律返回 null（沿用旧 cursor，不上送）。
+ * 增量只用 since_id，不用该接口的 cursor 分页参数。
+ */
+async function fetchXItems(
+  source: FeedSource,
+  env: Env
+): Promise<{
+  items: ParsedItem[];
+  nextCursor: { x: { since_id: string } } | null;
+}> {
+  const handle = extractXHandle(source.feed_url);
+  if (!handle) {
+    throw new Error("无法从 X 链接解析 handle");
+  }
+
+  const url = new URL("https://api.socialdata.tools/twitter/search");
+  let query = `from:${handle} -filter:replies -filter:retweets`;
+  const sinceId = source.cursor?.x?.since_id;
+  if (sinceId) {
+    query += ` since_id:${sinceId}`;
+  }
+  url.searchParams.set("query", query);
+  url.searchParams.set("type", "Latest");
+
+  // 429 直接报错不重试；5xx 最多重试 1 次
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let response: Response;
+    try {
+      response = await fetch(url.toString(), {
+        signal: AbortSignal.timeout(20000),
+        headers: {
+          Authorization: `Bearer ${env.SOCIALDATA_API_KEY}`,
+          Accept: "application/json",
+        },
+      });
+    } catch (e) {
+      lastError = e;
+      if (attempt === 0) {
+        await sleep(2000);
+        continue;
+      }
+      break;
+    }
+
+    if (response.status === 429) {
+      throw new Error("SocialData 限流 HTTP 429");
+    }
+
+    if (response.status >= 500) {
+      lastError = new Error(`SocialData 服务端错误 HTTP ${response.status}`);
+      if (attempt === 0) {
+        await sleep(2000);
+        continue;
+      }
+      break;
+    }
+
+    if (!response.ok) {
+      throw new Error(`SocialData 请求失败 HTTP ${response.status}`);
+    }
+
+    const data: any = await response.json();
+    const tweets: any[] = Array.isArray(data?.tweets) ? data.tweets : [];
+
+    const items: ParsedItem[] = [];
+    let maxId: bigint | null = null;
+
+    for (const tweet of tweets) {
+      const id = String(tweet?.id_str ?? tweet?.id ?? "").trim();
+      const text = String(tweet?.full_text ?? tweet?.text ?? "");
+      const summary = cleanSummary(text);
+      if (!summary) continue;
+
+      const tweetUrl =
+        (typeof tweet?.url === "string" && tweet.url) ||
+        (id && tweet?.user?.screen_name
+          ? `https://x.com/${tweet.user.screen_name}/status/${id}`
+          : "");
+      if (!tweetUrl) continue;
+
+      const publishedRaw = String(
+        tweet?.tweet_created_at ?? tweet?.created_at ?? ""
+      );
+      const publishedAt = publishedRaw ? new Date(publishedRaw) : null;
+
+      items.push({
+        title: summary.slice(0, 120),
+        url: tweetUrl,
+        summary,
+        published_at:
+          publishedAt && !isNaN(publishedAt.getTime())
+            ? publishedAt.toISOString()
+            : null,
+      });
+
+      // 推文 id 是雪花数，用 BigInt 比较取本批最大值
+      if (id) {
+        try {
+          const big = BigInt(id);
+          if (maxId === null || big > maxId) {
+            maxId = big;
+          }
+        } catch {
+          // 非数字 id，跳过 cursor 推进候选
+        }
+      }
+    }
+
+    if (items.length === 0 || maxId === null) {
+      return { items, nextCursor: null };
+    }
+
+    return { items, nextCursor: { x: { since_id: maxId.toString() } } };
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("SocialData 请求失败");
+}
+
 // ---------- 来源头像补抓 ----------
 
 // B站空间页 HTML 里的 "face":"..." 字段；JSON 内斜杠转义为 \/，需还原。
@@ -797,6 +958,8 @@ async function syncAll(env: Env): Promise<string> {
   for (const source of sources) {
     try {
       let items: ParsedItem[];
+      // 仅 X 等平台增量抓取成功且有新内容时才有值；null 表示沿用旧 cursor，不上送
+      let nextCursor: { x: { since_id: string } } | null = null;
 
       if (source.platform === "bilibili") {
         if (!source.feed_url) {
@@ -892,6 +1055,17 @@ async function syncAll(env: Env): Promise<string> {
           continue;
         }
         items = parseFeed(await xhsRes.text());
+      } else if (source.platform === "x") {
+        if (!env.SOCIALDATA_API_KEY) {
+          const msg = "未配置 SOCIALDATA_API_KEY";
+          logs.push(`[${source.name}] ${msg}`);
+          await reportSourceError(base, authHeaders, source.id, msg);
+          continue;
+        }
+
+        const xResult = await fetchXItems(source, env);
+        items = xResult.items;
+        nextCursor = xResult.nextCursor;
       } else {
         if (!source.feed_url) {
           const msg = "RSS 来源缺少 feed_url";
@@ -923,11 +1097,13 @@ async function syncAll(env: Env): Promise<string> {
       const pushRes = await fetch(`${base}/api/feed/items`, {
         method: "POST",
         headers: { ...authHeaders, "content-type": "application/json" },
-        body: JSON.stringify(
-          avatarUrl
-            ? { source_id: source.id, items, avatar_url: avatarUrl }
-            : { source_id: source.id, items }
-        ),
+        body: JSON.stringify({
+          source_id: source.id,
+          items,
+          ...(avatarUrl ? { avatar_url: avatarUrl } : {}),
+          // cursor 推进铁律：只有抓到新推文时 nextCursor 才有值，否则不带字段
+          ...(nextCursor ? { cursor: nextCursor } : {}),
+        }),
       });
       const result = (await pushRes.json().catch(() => ({}))) as {
         inserted?: number;

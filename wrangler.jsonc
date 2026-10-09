@@ -4,7 +4,8 @@
   "compatibility_date": "2026-09-30",
 
   "vars": {
-    "LZHE_BASE_URL": "https://liuzhe.world"
+    "LZHE_BASE_URL": "https://liuzhe.world",
+    "RSSHUB_BASE_URL": "https://rsshub.ktachibana.party"
   },
 
   "observability": {
