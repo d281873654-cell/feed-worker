@@ -744,16 +744,32 @@ async function fetchXItems(
     }
 
     const data: any = await response.json();
-    const tweets: any[] = Array.isArray(data?.tweets) ? data.tweets : [];
+    const tweets: any[] =
+      Array.isArray(data?.tweets)
+        ? data.tweets
+        : Array.isArray(data?.data)
+          ? data.data
+          : [];
 
     const items: ParsedItem[] = [];
     let maxId: bigint | null = null;
 
     for (const tweet of tweets) {
-      const id = String(tweet?.id_str ?? tweet?.id ?? "").trim();
+      let id = String(
+        tweet?.id_str ??
+        tweet?.id ??
+        tweet?.tweet_id ??
+        tweet?.rest_id ??
+        ""
+      ).trim();
       const text = String(tweet?.full_text ?? tweet?.text ?? "");
       const summary = cleanSummary(text);
       if (!summary) continue;
+
+      // 兜底：id 字段缺失或不是纯数字时，先从显式 url 反取 status 数字 id
+      if (!/^\d+$/.test(id) && typeof tweet?.url === "string") {
+        id = tweet.url.match(/\/status\/(\d+)/)?.[1] ?? "";
+      }
 
       const tweetUrl =
         (typeof tweet?.url === "string" && tweet.url) ||
@@ -761,6 +777,11 @@ async function fetchXItems(
           ? `https://x.com/${tweet.user.screen_name}/status/${id}`
           : "");
       if (!tweetUrl) continue;
+
+      // 再兜底：链接里反取数字 id（id 字段缺失/格式异常时 cursor 仍能推进）
+      if (!/^\d+$/.test(id)) {
+        id = tweetUrl.match(/\/status\/(\d+)/)?.[1] ?? "";
+      }
 
       const publishedRaw = String(
         tweet?.tweet_created_at ?? tweet?.created_at ?? ""
