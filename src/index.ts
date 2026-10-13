@@ -1054,7 +1054,7 @@ async function syncAll(env: Env): Promise<string> {
         items = parseFeed(await feedRes.text());
       } else if (source.platform === "xiaohongshu") {
         const uid = source.feed_url?.match(
-          /\/user\/profile\/([0-9a-f]{24})/
+          /\/user\/profile\/([0-9a-f]{6,32})/
         )?.[1];
         if (!uid) {
           const msg = "无法从小红书链接解析 uid";
